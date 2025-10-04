@@ -1,35 +1,23 @@
 from fastmcp import FastMCP
 import os
-import aiosqlite
-import asyncio
+import sqlite3
 import tempfile
-import json
 
-# Use safe writable temporary directory
+# Use temporary directory which should be writable
 TEMP_DIR = tempfile.gettempdir()
 DB_PATH = os.path.join(TEMP_DIR, "expenses.db")
-
-# Handle __file__ safely
-try:
-    BASE_DIR = os.path.dirname(__file__)
-except NameError:
-    BASE_DIR = os.getcwd()
-
-CATEGORIES_PATH = os.path.join(BASE_DIR, "categories.json")
+CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
 
 print(f"Database path: {DB_PATH}")
 
 mcp = FastMCP("ExpenseTracker")
 
-# -------------------- INITIALIZATION --------------------
-
-async def init_db():
-    """Initialize the SQLite database asynchronously."""
+def init_db():
     try:
-        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("PRAGMA journal_mode=WAL;")
-            await db.execute("""
+        # Create database with explicit write permissions
+        with sqlite3.connect(DB_PATH) as c:
+            c.execute("PRAGMA journal_mode=WAL")  # Better for concurrent access
+            c.execute("""
                 CREATE TABLE IF NOT EXISTS expenses(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     date TEXT NOT NULL,
@@ -40,47 +28,59 @@ async def init_db():
                 )
             """)
             # Test write access
-            await db.execute("INSERT INTO expenses(date, amount, category) VALUES ('2000-01-01', 0, 'test')")
-            await db.execute("DELETE FROM expenses WHERE category = 'test'")
-            await db.commit()
-            print("✅ Database initialized successfully with write access")
+            c.execute("INSERT OR IGNORE INTO expenses(date, amount, category) VALUES ('2000-01-01', 0, 'test')")
+            c.execute("DELETE FROM expenses WHERE category = 'test'")
+            print("Database initialized successfully with write access")
     except Exception as e:
-        print(f"❌ Database initialization error: {e}")
+        print(f"Database initialization error: {e}")
         raise
 
-# Run initialization synchronously at startup
-asyncio.run(init_db())
-
-# -------------------- MCP TOOLS --------------------
+init_db()
 
 @mcp.tool()
 async def add_expense(date: str, amount: float, category: str, subcategory: str = "", note: str = "") -> dict:
-    """Add a new expense entry to the database."""
+    """Add a new expense entry to the database.
+    
+    Args:
+        date: Expense date in YYYY-MM-DD format
+        amount: Expense amount
+        category: Expense category
+        subcategory: Optional subcategory
+        note: Optional note/description
+        
+    Returns:
+        Dict with status, id (if successful), and message
+    """
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute(
+        with sqlite3.connect(DB_PATH) as c:
+            cur = c.execute(
                 "INSERT INTO expenses(date, amount, category, subcategory, note) VALUES (?,?,?,?,?)",
                 (date, amount, category, subcategory, note)
             )
-            await db.commit()
             expense_id = cur.lastrowid
+            c.commit()  # Explicit commit
             return {"status": "success", "id": expense_id, "message": "Expense added successfully"}
-    except aiosqlite.OperationalError as e:
-        msg = str(e).lower()
-        if "readonly" in msg:
-            return {"status": "error", "message": "Database is read-only. Check file permissions."}
-        return {"status": "error", "message": f"Database operational error: {str(e)}"}
+    except sqlite3.OperationalError as e:
+        if "readonly" in str(e).lower():
+            return {"status": "error", "message": "Database is in read-only mode. Check file permissions."}
+        return {"status": "error", "message": f"Database error: {str(e)}"}
     except Exception as e:
         return {"status": "error", "message": f"Unexpected error: {str(e)}"}
-
-
+    
 @mcp.tool()
-async def list_expenses(start_date: str, end_date: str) -> dict:
-    """List expense entries within an inclusive date range."""
+async def list_expenses(start_date: str, end_date: str) -> list[dict]:
+    """List expense entries within an inclusive date range.
+    
+    Args:
+        start_date: Start date in YYYY-MM-DD format
+        end_date: End date in YYYY-MM-DD format
+        
+    Returns:
+        List of expense dictionaries
+    """
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
+        with sqlite3.connect(DB_PATH) as c:
+            cur = c.execute(
                 """
                 SELECT id, date, amount, category, subcategory, note
                 FROM expenses
@@ -88,20 +88,26 @@ async def list_expenses(start_date: str, end_date: str) -> dict:
                 ORDER BY date DESC, id DESC
                 """,
                 (start_date, end_date)
-            ) as cur:
-                rows = await cur.fetchall()
-                return {"status": "success", "expenses": [dict(row) for row in rows]}
+            )
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
     except Exception as e:
-        return {"status": "error", "message": f"Error listing expenses: {str(e)}"}
-
+        return [{"status": "error", "message": f"Error listing expenses: {str(e)}"}]
 
 @mcp.tool()
-async def summarize(start_date: str, end_date: str, category: str = None) -> dict:
-    """Summarize expenses by category within an inclusive date range."""
+async def summarize(start_date: str, end_date: str, category: str = None) -> list[dict]:
+    """Summarize expenses by category within an inclusive date range.
+    
+    Args:
+        start_date: Start date in YYYY-MM-DD format
+        end_date: End date in YYYY-MM-DD format
+        category: Optional category filter
+        
+    Returns:
+        List of summary dictionaries by category
+    """
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-
+        with sqlite3.connect(DB_PATH) as c:
             query = """
                 SELECT category, SUM(amount) AS total_amount, COUNT(*) as count
                 FROM expenses
@@ -115,41 +121,41 @@ async def summarize(start_date: str, end_date: str, category: str = None) -> dic
 
             query += " GROUP BY category ORDER BY total_amount DESC"
 
-            async with db.execute(query, params) as cur:
-                rows = await cur.fetchall()
-                return {"status": "success", "summary": [dict(row) for row in rows]}
+            cur = c.execute(query, params)
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
     except Exception as e:
-        return {"status": "error", "message": f"Error summarizing expenses: {str(e)}"}
-
+        return [{"status": "error", "message": f"Error summarizing expenses: {str(e)}"}]
 
 @mcp.resource("expense://categories", mime_type="application/json")
 async def categories() -> str:
     """Get available expense categories."""
-    default_categories = {
-        "categories": [
-            "Food & Dining",
-            "Transportation",
-            "Shopping",
-            "Entertainment",
-            "Bills & Utilities",
-            "Healthcare",
-            "Travel",
-            "Education",
-            "Business",
-            "Other"
-        ]
-    }
-
     try:
-        if os.path.exists(CATEGORIES_PATH):
-            async with await asyncio.to_thread(open, CATEGORIES_PATH, "r", encoding="utf-8") as f:
-                return await asyncio.to_thread(f.read)
-        else:
+        # Provide default categories if file doesn't exist
+        default_categories = {
+            "categories": [
+                "Food & Dining",
+                "Transportation",
+                "Shopping",
+                "Entertainment",
+                "Bills & Utilities",
+                "Healthcare",
+                "Travel",
+                "Education",
+                "Business",
+                "Other"
+            ]
+        }
+        
+        try:
+            with open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
+                return f.read()
+        except FileNotFoundError:
+            import json
             return json.dumps(default_categories, indent=2)
     except Exception as e:
-        return json.dumps({"error": f"Could not load categories: {str(e)}"})
+        return f'{{"error": "Could not load categories: {str(e)}"}}'
 
-# -------------------- SERVER ENTRY --------------------
-
+# Start the server
 if __name__ == "__main__":
     mcp.run(transport="http", port=8000)
