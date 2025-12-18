@@ -127,7 +127,7 @@ async def summarize(start_date: str, end_date: str, category: str = None) -> lis
     except Exception as e:
         return [{"status": "error", "message": f"Error summarizing expenses: {str(e)}"}]
 
-@mcp.resource("expense://categories", mime_type="application/json")
+@mcp.resource("expense://categories", mime_type="application/json" , description="Get available expense categories")
 async def categories() -> str:
     """Get available expense categories."""
     try:
